@@ -6,7 +6,7 @@ and expensive to discover during a 60-minute submission run.
 import pytest
 
 from client import (MODE_DURATION, TAIL_MARGIN_SECONDS, ArenaClient,
-                    run_ceiling)
+                    confirm_scored_run, normalise_confirmation, run_ceiling)
 
 
 class TestRunCeiling:
@@ -62,6 +62,48 @@ class TestNewRunFlag:
         c = self._client()
         c.cursor = 4213
         assert c._stream_params()["from"] == 4213
+
+
+class TestScoredRunConfirmation:
+    """The guard on a scarce resource: 3 submission attempts, 1 final.
+
+    Added after the prompt failed to display under a `2>` stderr redirect --
+    input()'s prompt argument goes through the C-level readline path and was
+    swallowed, leaving a bare cursor with no instruction. Typing 'y' at it
+    cancelled the run. No attempt was lost, but only because the confirmation
+    sits before any /v1/stream call.
+    """
+
+    @pytest.mark.parametrize("typed", ["submission", " submission ",
+                                       "﻿submission", "submission\n"])
+    def test_exact_mode_name_proceeds(self, typed, capsys):
+        assert confirm_scored_run("submission", 4500, True,
+                                  read_line=lambda: typed) is True
+
+    @pytest.mark.parametrize("typed", ["y", "yes", "", "Submission",
+                                       "final", "n", "  "])
+    def test_anything_else_cancels(self, typed, capsys):
+        assert confirm_scored_run("submission", 4500, True,
+                                  read_line=lambda: typed) is False
+        out = capsys.readouterr().out
+        assert "NO ATTEMPT WAS CONSUMED" in out
+
+    def test_eof_cancels_rather_than_crashing(self, capsys):
+        def raise_eof():
+            raise EOFError
+        assert confirm_scored_run("final", 5400, True,
+                                  read_line=raise_eof) is False
+
+    def test_the_required_word_is_printed_not_just_prompted(self, capsys):
+        """The whole point: the instruction must survive a stderr redirect, so
+        it has to go through print(), not input()'s prompt argument."""
+        confirm_scored_run("submission", 4500, True, read_line=lambda: "y")
+        out = capsys.readouterr().out
+        assert "Type exactly:  submission" in out
+        assert "WILL count" in out
+
+    def test_bom_does_not_reject_a_correct_answer(self):
+        assert normalise_confirmation("﻿submission") == "submission"
 
 
 class TestPostingBatchLimit:

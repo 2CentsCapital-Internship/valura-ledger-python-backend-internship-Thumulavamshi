@@ -372,6 +372,42 @@ def run_ceiling(mode: str, rules: dict) -> float:
     return float(duration) + TAIL_MARGIN_SECONDS
 
 
+def normalise_confirmation(raw: str) -> str:
+    """Whitespace and a UTF-8 BOM stripped.
+
+    Some shells prepend a BOM when input is piped, which would reject a CORRECT
+    answer -- baffling at the exact moment you least want to be baffled.
+    """
+    return raw.strip().lstrip("﻿").strip()
+
+
+def confirm_scored_run(mode: str, seconds: float, start_new: bool,
+                       read_line=input) -> bool:
+    """Guard on a scarce resource: submission has 3 attempts, final has 1.
+
+    The prompt is a plain print(), NOT input()'s prompt argument. That argument
+    goes through the C-level readline path and gets swallowed when stderr is
+    redirected -- which leaves a bare cursor and no instruction on screen. Being
+    unclear here is how an attempt gets wasted.
+    """
+    print(f"\n  You are about to start a {mode.upper()} run.")
+    print(f"  Attempts are limited and this one WILL count.")
+    print(f"  Wall-clock ceiling: {seconds:.0f}s. Start a new run: {start_new}.")
+    print(f"\n  Type exactly:  {mode}")
+    print("  (anything else cancels; nothing has been sent to the server yet)")
+    print("  > ", end="", flush=True)
+    try:
+        typed = normalise_confirmation(read_line())
+    except EOFError:
+        typed = ""
+    if typed != mode:
+        print(f"\n  Cancelled. You typed {typed!r}; expected {mode!r}.")
+        print("  NO ATTEMPT WAS CONSUMED -- the run was never started.")
+        return False
+    print()
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="https://hiring-arena.twocc.in")
@@ -399,13 +435,8 @@ def main() -> int:
     rules = fetch_rules(a.url, a.key)
     seconds = a.seconds if a.seconds is not None else run_ceiling(a.mode, rules)
 
-    if a.mode != "practice":
-        print(f"\n  You are about to start a {a.mode.upper()} run.")
-        print(f"  Attempts are limited and this one will count.")
-        print(f"  Wall-clock ceiling: {seconds:.0f}s. New run: {a.new}.")
-        if input("  Type the mode name to continue: ").strip() != a.mode:
-            print("  Cancelled.")
-            return 1
+    if a.mode != "practice" and not confirm_scored_run(a.mode, seconds, a.new):
+        return 1
 
     capture = a.capture
     if capture is None:
