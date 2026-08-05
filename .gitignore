@@ -4,3 +4,22 @@ __pycache__/
 venv/
 .env
 key.txt
+
+# Captured practice runs ARE committed (~2 MB total). They are the evidence
+# base for every finding in LOGIC.md and they make the analysis reproducible:
+#   python tools/diagnose.py captures/<run>.jsonl --check
+# re-grades the current code against a real graded run without spending a
+# practice attempt. Scored-mode captures are excluded -- they are larger and
+# carry no diagnostics.
+captures/submission-*
+captures/final-*
+.pytest_cache/
+
+# local agent/editor config
+.claude/
+
+LOGIC.md
+PROJECT.md
+task_description.txt
+TECHNICAL_PLAN.md
+NOTES.md
