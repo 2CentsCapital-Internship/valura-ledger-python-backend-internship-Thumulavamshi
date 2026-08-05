@@ -107,24 +107,37 @@ def on_order_placed(state, p: dict, event: dict) -> list[dict]:
 
 
 def _remaining_hold(order: Order) -> Decimal:
-    """The unreleased share of the hold.
+    """The unreleased hold, on a DECLINING BALANCE.
 
-    A-4, CONFIRMED against practice run 3's checkpoint diagnostics: each fill
-    releases `round(initial_hold x fill_qty / order_qty)`, rounded
-    INDEPENDENTLY per fill, and the remainder is what is left after subtracting
-    the sum of those roundings.
+        release_i      = round(remaining_hold x fill_qty_i / remaining_qty)
+        remaining_hold -= release_i
+        remaining_qty  -= fill_qty_i
 
-    Rounding once on the cumulative filled quantity instead lands a cent away.
-    That single cent was the last defect in the book: every other part of every
-    checkpoint scored 1.0 while cash_hold sat at 0.9167.
+    Each fill releases a share of what REMAINS, measured against the quantity
+    that REMAINS -- not a share of the original hold against the original
+    quantity. See LOGIC.md section 9.3 for the full reasoning; the essentials:
 
-        order qty 48, initial hold 9231.44, two fills of 10
-          per fill    round(9231.44 x 10/48) = 1923.22, twice -> 5385.00  correct
-          cumulative  round(9231.44 x 20/48) = 3846.43       -> 5385.01  wrong
+    * A hold is a running reservation against an OUTSTANDING commitment, not an
+      amortisation schedule fixed at placement. After a partial fill the
+      commitment is the remaining shares, and the next fill consumes part of
+      that remainder. Computing every release from the original order treats
+      the split as decided at placement time and unaffected by what earlier
+      fills actually released, which is not what a reservation is.
 
-    Two rival readings were refuted by the same data: releasing the principal
-    while holding est_charges whole, and releasing each fill's actual
-    principal. Both fixed the flagged customer and broke an unflagged one.
+    * It is SELF-CLOSING. "A closed order always returns its hold to exactly
+      zero." When a fill takes the whole remaining quantity the release is
+      round(remaining_hold x q / q) = remaining_hold exactly, so the balance
+      reaches zero by construction. Computing from the original leaves a
+      rounding residual that has to be papered over by forcing zero on the
+      final fill -- and the sheet never mentions such a residual, because on
+      this formula there isn't one.
+
+    * It is the SAME SHAPE as the one proportional-consumption formula the
+      sheet actually specifies. FIFO cost relief is
+      `round(lot_total x sold_qty / lot_qty)` where lot_total and lot_qty are
+      the lot's CURRENT values, already reduced by earlier reliefs, and "the
+      remainder stays with the lot". That is declining balance applied to lots.
+      `ledger/lots.py` implements exactly this; holds now match.
 
     Recomputed from the recorded fill quantities rather than accumulated
     incrementally, so a replay reproduces it exactly.
@@ -136,13 +149,15 @@ def _remaining_hold(order: Order) -> Decimal:
     if order.filled_quantity >= order.quantity:
         return ZERO
 
-    released = sum(
-        (money(order.initial_hold * q / order.quantity)
-         for q in order.fill_quantities),
-        ZERO,
-    )
-    remaining = order.initial_hold - released
-    return remaining if remaining > ZERO else ZERO
+    remaining_hold = order.initial_hold
+    remaining_qty = order.quantity
+    for fill_qty in order.fill_quantities:
+        if remaining_qty <= ZERO_QTY:
+            break
+        release = money(remaining_hold * fill_qty / remaining_qty)
+        remaining_hold -= release
+        remaining_qty -= fill_qty
+    return remaining_hold if remaining_hold > ZERO else ZERO
 
 
 def on_trade_settled(state, p: dict, event: dict) -> list[dict]:

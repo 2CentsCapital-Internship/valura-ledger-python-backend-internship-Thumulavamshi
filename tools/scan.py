@@ -26,7 +26,8 @@ from __future__ import annotations
 import argparse
 import sys
 from collections import defaultdict
-from decimal import Decimal, InvalidOperation
+from decimal import (Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_EVEN,
+                     ROUND_HALF_UP)
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -331,6 +332,128 @@ def scan_a14_fx_spread(events) -> dict:
     }
 
 
+MICRO = D("0.000001")
+
+
+def scan_a16_split_rounding(events) -> dict:
+    """A-16: does a stock_split ever land a lot quantity on a rounding boundary?
+
+    The sheet fixes "half away from zero" for MONEY. It says only that share
+    quantities have "up to 6" decimal places, with no rounding rule -- so our
+    choice of half-away-from-zero for quantities is an assumption, not a
+    reading.
+
+    It only matters when `quantity x ratio_to / ratio_from` lands exactly on a
+    half at the 7th decimal, where half-up, half-even and truncation disagree.
+    Practice runs 3 and 5 produced ZERO such cases in 73 scaled lots; submission
+    run 1 produced 21 in 379. That is why a perfect practice checkpoint did not
+    transfer.
+
+    Also reports TRIGGER DENSITY, so a run can be judged on whether it had a
+    realistic chance of reproducing the case at all -- an absent result from a
+    low-density run says much less than one from a high-density run.
+    """
+    from ledger.engine import LedgerEngine     # local: avoids an import cycle
+
+    engine = LedgerEngine(event_log=None)
+    scaled_lots = 0
+    boundary = []
+    fractional_lots_at_split = 0
+    first_hit_index = None
+
+    for index, event in enumerate(events):
+        if event.get("type") == "stock_split":
+            p = _payload(event)
+            cid, sym = p.get("customer_id"), p.get("symbol")
+            ratio_from = _dec(p.get("ratio_from"), ZERO)
+            ratio_to = _dec(p.get("ratio_to"), ZERO)
+            if ratio_from > ZERO and ratio_to > ZERO:
+                for lot in engine.state.lots.get((cid, sym), []):
+                    if lot.quantity <= ZERO_QTY:
+                        continue
+                    scaled_lots += 1
+                    if lot.quantity != lot.quantity.to_integral_value():
+                        fractional_lots_at_split += 1
+                    exact = lot.quantity * ratio_to / ratio_from
+                    if exact != exact.quantize(MICRO, rounding=ROUND_HALF_UP):
+                        if first_hit_index is None:
+                            first_hit_index = index
+                        half_up = exact.quantize(MICRO, rounding=ROUND_HALF_UP)
+                        half_even = exact.quantize(MICRO, rounding=ROUND_HALF_EVEN)
+                        trunc = exact.quantize(MICRO, rounding=ROUND_DOWN)
+                        boundary.append({
+                            "event_id": event.get("event_id"),
+                            "stream_index": index,
+                            "customer_id": cid, "symbol": sym,
+                            "ratio": f"{ratio_from}->{ratio_to}",
+                            "lot_seq": lot.seq,
+                            "quantity_before": str(lot.quantity),
+                            "exact": str(exact),
+                            "half_up": str(half_up),
+                            "half_even": str(half_even),
+                            "truncated": str(trunc),
+                            # Which open question can this case actually settle?
+                            # Truncation was ruled out on 2026-08-05; the live
+                            # question is half-up vs half-even, and only a case
+                            # where those two DIFFER can settle it. They differ
+                            # exactly when the 6th decimal is even.
+                            "discriminates_half_up_vs_half_even": half_up != half_even,
+                            "discriminates_rounding_vs_truncation": half_up != trunc,
+                        })
+        engine.apply(event)
+
+    # Did any affected lot go on to feed a FIFO cost relief? That is the
+    # difference between 0.8 points at risk (quantity) and 25.6 (cost basis).
+    consumed_seqs = {seq for fill in engine.state.fills.values()
+                     for seq, _q, _c in fill.consumption}
+    fed_cost_relief = [b for b in boundary if b["lot_seq"] in consumed_seqs]
+
+    n = max(len(events), 1)
+    density = {
+        "events": len(events),
+        "dividend_reinvested": sum(1 for e in events
+                                   if e.get("type") == "dividend_reinvested"),
+        "stock_split": sum(1 for e in events if e.get("type") == "stock_split"),
+        "lots_scaled_by_splits": scaled_lots,
+        "fractional_lots_at_split_time": fractional_lots_at_split,
+        "scaled_lots_per_1000_events": round(1000 * scaled_lots / n, 1),
+        "boundary_hits": len(boundary),
+        "boundary_hit_rate_of_scaled_lots":
+            f"{100 * len(boundary) / scaled_lots:.1f}%" if scaled_lots else "n/a",
+        "first_hit_at_stream_index": first_hit_index,
+    }
+
+    discriminating = [b for b in boundary
+                      if b["discriminates_half_up_vs_half_even"]]
+
+    if boundary and discriminating:
+        verdict = (f"PRESENT and DECISIVE -- {len(boundary)} boundary case(s), "
+                   f"{len(discriminating)} of which separate half-up from "
+                   f"half-even. This run CAN settle the open half of A-16: "
+                   f"check the checkpoint diff for the named customer/symbol.")
+    elif boundary:
+        verdict = (f"PRESENT but NOT decisive -- {len(boundary)} boundary "
+                   f"case(s), none of which separate half-up from half-even "
+                   f"(they differ only when the 6th decimal is even). Confirms "
+                   f"rounding-not-truncation again; leaves the open half of "
+                   f"A-16 open.")
+    elif scaled_lots == 0:
+        verdict = ("ABSENT and UNINFORMATIVE -- no lots were scaled by a split "
+                   "at all, so this run could not have tested A-16.")
+    else:
+        verdict = (f"ABSENT -- {scaled_lots} lots scaled, none on a boundary. "
+                   f"Weak evidence at best: see the density figures for whether "
+                   f"this run had a realistic chance of hitting the case.")
+
+    return {
+        "verdict": verdict,
+        "density": density,
+        "boundary_cases": boundary[:10],
+        "fed_cost_relief": fed_cost_relief[:5],
+        "n_fed_cost_relief": len(fed_cost_relief),
+    }
+
+
 def scan_all(events) -> dict:
     return {
         "n_events": len(events),
@@ -340,6 +463,7 @@ def scan_all(events) -> dict:
         "a7_oversell_boundary": scan_a7_oversell_boundary(events),
         "a9_zero_legs": scan_a9_zero_legs(events),
         "a14_fx_spread": scan_a14_fx_spread(events),
+        "a16_split_rounding": scan_a16_split_rounding(events),
     }
 
 
@@ -364,6 +488,7 @@ def _render(report: dict) -> str:
         ("a5_reversal_of_consumed_buy", "A-5  reversal of a consumed buy lot"),
         ("a7_oversell_boundary", "A-7  oversell boundary"),
         ("a14_fx_spread", "A-14 fx_deposit zero / negative spread"),
+        ("a16_split_rounding", "A-16 split quantity rounding boundary"),
     ]:
         out.append(f"-- {title}")
         out.append(f"     {report[key]['verdict']}")
@@ -379,7 +504,21 @@ def _render(report: dict) -> str:
     out.append(f"     {a9['a9b_zero_custody_or_regulatory']['verdict']}")
     out.append(f"     buys: {a9['a9b_zero_custody_or_regulatory']['n_buys']}, "
                f"all sides: {a9['a9b_zero_custody_or_regulatory']['n_total']}")
+    a16 = report["a16_split_rounding"]
+    d = a16["density"]
+    out.append("     TRIGGER DENSITY (can this run test A-16 at all?)")
+    out.append(f"       dividend_reinvested        {d['dividend_reinvested']:>6}")
+    out.append(f"       stock_split                {d['stock_split']:>6}")
+    out.append(f"       lots scaled by splits      {d['lots_scaled_by_splits']:>6}"
+               f"   ({d['scaled_lots_per_1000_events']} per 1000 events)")
+    out.append(f"       fractional at split time   {d['fractional_lots_at_split_time']:>6}")
+    out.append(f"       boundary hits              {d['boundary_hits']:>6}"
+               f"   ({d['boundary_hit_rate_of_scaled_lots']} of scaled lots)")
+    if a16["n_fed_cost_relief"]:
+        out.append(f"       ... that fed a cost relief {a16['n_fed_cost_relief']:>6}"
+                   f"   <-- these touch the 64% slice")
     out.append("")
+
     out.append("full report:")
     out.append(dumps(report))
     return "\n".join(out)

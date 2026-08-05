@@ -206,17 +206,15 @@ class TestNoLegEventsHaveStateEffects:
         # 25 of 100 filled -> release 1253.00, leaving 3759.00
         assert str(engine.state.orders["ord_1"].remaining_hold) == "3759.00"
 
-    def test_each_fill_is_rounded_INDEPENDENTLY(self, engine):
-        """A-4, confirmed by run 3's checkpoint diff. The real numbers:
-        order qty 48, limit 191.78, est_charges 26.00 -> hold 9231.44, then
-        two fills of 10.
+    def test_hold_releases_on_a_DECLINING_BALANCE(self, engine):
+        """A-4, from run 3's checkpoint diff. Order qty 48, limit 191.78,
+        est_charges 26.00 -> hold 9231.44, then two fills of 10:
 
-            per fill    round(9231.44 x 10/48) = 1923.22 twice -> 5385.00
-            cumulative  round(9231.44 x 20/48) = 3846.43       -> 5385.01
+            release 1  round(9231.44 x 10/48) = 1923.22  -> 7308.22 left
+            release 2  round(7308.22 x 10/38) = 1923.22  -> 5385.00 left
 
-        The reference wants 5385.00. That one cent was the last defect in the
-        book -- every other checkpoint part scored 1.0 while cash_hold sat at
-        0.9167.
+        The reference wants 5385.00. Note the second release is measured
+        against the REMAINING 7308.22 over the REMAINING 38 shares.
         """
         engine.apply(self._place(quantity="48", limit_price="191.78",
                                  est_charges="26.00"))
@@ -226,12 +224,78 @@ class TestNoLegEventsHaveStateEffects:
         engine.apply(buy_fill(order_id="ord_1", quantity="10",
                               principal="1917.80", final=False,
                               trade_id="t1"))
+        assert str(order.remaining_hold) == "7308.22"
+
         engine.apply(buy_fill(order_id="ord_1", quantity="10",
                               principal="1917.80", final=False,
                               trade_id="t2"))
-
         assert str(order.remaining_hold) == "5385.00"
         assert order.fill_quantities == [D("10"), D("10")]
+
+    def test_declining_balance_is_SELF_CLOSING(self, engine):
+        """"A closed order always returns its hold to exactly zero."
+
+        On a declining balance that is structural, not a special case: the last
+        release is round(remaining x q/q) = remaining exactly. Computing every
+        release from the ORIGINAL hold leaves a rounding residual that has to
+        be forced to zero -- and the sheet never mentions such a residual.
+        """
+        engine.apply(self._place(quantity="3", limit_price="10.00",
+                                 est_charges="0.01"))          # hold 30.01
+        order = engine.state.orders["ord_1"]
+
+        for i, q in enumerate(("1", "1", "1")):
+            engine.apply(buy_fill(order_id="ord_1", quantity=q,
+                                  principal="10.00", final=(i == 2),
+                                  trade_id=f"t{i}"))
+        assert order.remaining_hold == D("0.00")
+
+    @pytest.mark.parametrize("qty,limit,est,fills,expected,note", [
+        # Real fixtures from practice run 7 (practice-20260805-210759),
+        # verified against that run's checkpoint diff.
+        ("36", "281.34", "33.00", ["10", "13", "10"], "846.77",
+         "CUST-1005 -- flagged wrong under the old formula (gave 846.76)"),
+        ("35", "326.09", "32.00", ["10", "12.5", "6.25"], "2043.77",
+         "CUST-1009 -- flagged wrong under the old formula (gave 2043.78)"),
+        ("22", "217.97", "14.00", ["11", "5.5", "2.75"], "601.16",
+         "CUST-1008 -- NEGATIVE CONTROL: both formulas agree, and the "
+         "reference did NOT flag this customer. A fix that changed this "
+         "value would be wrong."),
+    ])
+    def test_real_fixtures_from_the_checkpoint_diff(self, engine, qty, limit,
+                                                   est, fills, expected, note):
+        """The three cases that identified the formula.
+
+        Two were flagged by the reference and one was not -- the unflagged one
+        is the control that killed five rival hypotheses, each of which fixed a
+        flagged customer while breaking this one.
+        """
+        engine.apply(self._place(quantity=qty, limit_price=limit,
+                                 est_charges=est))
+        order = engine.state.orders["ord_1"]
+        for i, q in enumerate(fills):
+            engine.apply(buy_fill(order_id="ord_1", quantity=q,
+                                  principal="1.00", final=False,
+                                  trade_id=f"t{i}"))
+        assert str(order.remaining_hold) == expected, note
+
+    def test_the_old_per_fill_formula_would_now_fail(self, engine):
+        """Pins the difference explicitly, so nobody reverts to computing every
+        release from the original hold."""
+        engine.apply(self._place(quantity="36", limit_price="281.34",
+                                 est_charges="33.00"))
+        order = engine.state.orders["ord_1"]
+        for i, q in enumerate(("10", "13", "10")):
+            engine.apply(buy_fill(order_id="ord_1", quantity=q,
+                                  principal="1.00", final=False,
+                                  trade_id=f"t{i}"))
+
+        from ledger.money import money
+        old = order.initial_hold - sum(
+            (money(order.initial_hold * q / order.quantity)
+             for q in order.fill_quantities), D("0.00"))
+        assert str(old) == "846.76"                  # what we used to report
+        assert str(order.remaining_hold) == "846.77"  # what the reference wants
 
     def test_the_release_is_recomputed_not_accumulated(self, engine):
         """Recomputing from the recorded fill quantities keeps a replay exact.
